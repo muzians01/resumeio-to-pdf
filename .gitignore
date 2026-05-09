@@ -164,3 +164,9 @@ cython_debug/
 # PDF
 *.pdf
 .vercel
+
+# MacOS
+.DS_Store
+
+# Worker cache
+app/renderer/.worker_cache/

@@ -1,100 +1,156 @@
-import io
+import json
+import logging
+import re
+import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from pathlib import Path
 
-import pytesseract
 import requests
 from fastapi import HTTPException
-from PIL import Image
 
-from app.schemas.resumeio import Extension
+logger = logging.getLogger(__name__)
+
+RESUMEIO_BASE = "https://resume.io"
+WORKER_CACHE_DIR = Path(__file__).parent.parent / "renderer" / ".worker_cache"
+RENDER_SCRIPT = Path(__file__).parent.parent / "renderer" / "render.mjs"
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
+)
 
 
 @dataclass
-class ResumeioDownloader:
-    """
-    Class to download a resume from resume.io and convert it to a PDF.
+class ResumeioRenderer:
+    """Render a resume.io document JSON as a multi-page PDF.
+
+    Uses resume.io's own rendering Web Worker (run via Node.js) to produce
+    a pixel-perfect PDF from the resume document JSON and renderer config.
 
     Parameters
     ----------
-    rendering_token : str
-        Rendering Token of the resume to download.
-    extension : Extension, optional
-        Image extension to download, by default "jpeg".
-    image_size : int, optional
-        Size of the images to download, by default 2000.
+    document : dict
+        The full resume document JSON from resume.io.
     """
 
-    rendering_token: str
-    extension: Extension = Extension.jpeg
-    image_size: int = 2000
-    IMAGE_URL: str = (
-        "https://ssr.resume.tools/to-image/{rendering_token}-1.{extension}?cache={cache_date}&size={image_size}"
-    )
-
-    def __post_init__(self) -> None:
-        """Set the cache date to the current time."""
-        self.cache_date = datetime.now(timezone.utc).isoformat()[:-10] + "Z"
+    document: dict
 
     def generate_pdf(self) -> bytes:
-        """
-        Generate a PDF from the resume.io resume.
+        """Generate a PDF from the resume document.
 
         Returns
         -------
         bytes
-            PDF representation of the resume.
+            PDF file contents.
         """
-        image = self.__download_image()
-        page_pdf = pytesseract.image_to_pdf_or_hocr(Image.open(image), extension="pdf", config="--dpi 300")
-        return page_pdf
+        locale = self.document.get("locale", "en")
+        config = self._get_renderer_config(locale)
+        self._ensure_worker_assets()
+        return self._render(self.document, config)
 
-    def __download_image(self) -> io.BytesIO:
-        """Download the first page image of the resume.
-
-        Returns
-        -------
-        io.BytesIO
-            Image file.
-        """
-        image_url = self.IMAGE_URL.format(
-            rendering_token=self.rendering_token,
-            extension=self.extension.value,
-            cache_date=self.cache_date,
-            image_size=self.image_size,
-        )
-        response = self.__get(image_url)
-        return io.BytesIO(response.content)
-
-    def __get(self, url: str) -> requests.Response:
-        """Get a response from a URL.
-
-        Parameters
-        ----------
-        url : str
-            URL to get.
-
-        Returns
-        -------
-        requests.Response
-            Response object.
-
-        Raises
-        ------
-        HTTPException
-            If the response status code is not 200.
-        """
+    def _get_renderer_config(self, locale: str) -> dict:
+        """Fetch the renderer configuration for the given locale."""
         response = requests.get(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/136.0.0.0 Safari/537.36",
-            },
+            f"{RESUMEIO_BASE}/api/app/general/renderer-config/{locale}",
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
         )
         if response.status_code != 200:
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Unable to download resume (rendering token: {self.rendering_token})",
-            )
-        return response
+            raise HTTPException(status_code=502, detail="Failed to fetch renderer config")
+        return response.json()
+
+    def _ensure_worker_assets(self) -> None:
+        """Download and cache the rendering Web Worker and its vendor chunks."""
+        if (WORKER_CACHE_DIR / "rendering.js").exists():
+            return
+
+        logger.info("Downloading Web Worker assets from resume.io...")
+        WORKER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # 1. Find builder JS from the app page
+        html = self._get_public(f"{RESUMEIO_BASE}/app/resumes")
+        builder_match = re.search(r'/assets/js/builder-[^"\']+\.js', html)
+        if not builder_match:
+            raise HTTPException(status_code=502, detail="Could not find builder JS on resume.io")
+        builder_url = f"{RESUMEIO_BASE}{builder_match.group()}"
+
+        # 2. Find the rendering-core chunk hash from builder JS
+        builder_js = self._get_public(builder_url)
+        core_id_match = re.search(r'\{(\d+):"rendering-core"', builder_js)
+        if not core_id_match:
+            raise HTTPException(status_code=502, detail="Could not find rendering-core chunk ID")
+        core_id = core_id_match.group(1)
+
+        hash_match = re.search(rf'\{{{core_id}:"([a-f0-9]+)"', builder_js)
+        if not hash_match:
+            raise HTTPException(status_code=502, detail="Could not find rendering-core chunk hash")
+        core_hash = hash_match.group(1)
+
+        # 3. Find the worker URL from the rendering-core chunk
+        core_url = f"{RESUMEIO_BASE}/assets/chunk/rendering-core.{core_hash}.js"
+        core_js = self._get_public(core_url)
+        worker_match = re.search(r"workers/rendering\.[a-f0-9]+\.js", core_js)
+        if not worker_match:
+            raise HTTPException(status_code=502, detail="Could not find rendering worker URL")
+        worker_filename = worker_match.group()
+
+        # 4. Download the main rendering worker
+        worker_url = f"{RESUMEIO_BASE}/assets/{worker_filename}"
+        self._download(worker_url, WORKER_CACHE_DIR / "rendering.js")
+        worker_code = (WORKER_CACHE_DIR / "rendering.js").read_text()
+
+        # 5. Download numbered chunks (e.g., workers/171.xxx.js)
+        for chunk_ref in re.findall(r"workers/\d+\.[a-f0-9]+\.js", worker_code):
+            filename = chunk_ref.split("/")[-1]
+            self._download(f"{RESUMEIO_BASE}/assets/{chunk_ref}", WORKER_CACHE_DIR / filename)
+
+        # 6. Download vendor chunks (e.g., workers/vendors.xxx.js)
+        vendor_hashes = re.findall(r'\{[\d:,"a-f]+\}', worker_code)
+        for block in vendor_hashes:
+            for match in re.finditer(r'(\d+):"([a-f0-9]{16,})"', block):
+                vendor_hash = match.group(2)
+                filename = f"vendors.{vendor_hash}.js"
+                if not (WORKER_CACHE_DIR / filename).exists():
+                    try:
+                        self._download(
+                            f"{RESUMEIO_BASE}/assets/workers/{filename}",
+                            WORKER_CACHE_DIR / filename,
+                        )
+                    except HTTPException:
+                        pass  # Some hashes may not be vendor chunks
+
+    def _get_public(self, url: str) -> str:
+        """Fetch a public URL and return the text content."""
+        response = requests.get(url, headers={"User-Agent": USER_AGENT})
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch {url}")
+        return response.text
+
+    def _download(self, url: str, path: Path) -> None:
+        """Download a file preserving raw bytes (some JS files embed binary data)."""
+        logger.info("Downloading %s", path.name)
+        response = requests.get(url, headers={"User-Agent": USER_AGENT})
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch {url}")
+        path.write_bytes(response.content)
+
+    def _render(self, document: dict, config: dict) -> bytes:
+        """Run the rendering Web Worker via Node.js and return the PDF bytes."""
+        payload = json.dumps({
+            "document": document,
+            "config": config,
+            "workerDir": str(WORKER_CACHE_DIR),
+        })
+
+        result = subprocess.run(
+            ["node", str(RENDER_SCRIPT)],
+            input=payload.encode(),
+            capture_output=True,
+            timeout=120,
+        )
+
+        if result.returncode != 0:
+            error_msg = result.stderr.decode().strip()
+            raise HTTPException(status_code=500, detail=f"Rendering failed: {error_msg}")
+
+        return result.stdout

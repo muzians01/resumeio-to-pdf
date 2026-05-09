@@ -1,9 +1,11 @@
 FROM python:3.12.13-slim
 
-# Update, install tesseract, clean up
-RUN apt-get update  \
+# Install Node.js
+RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-    tesseract-ocr \
+    curl \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

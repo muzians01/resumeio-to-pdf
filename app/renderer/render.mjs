@@ -4,7 +4,15 @@ import { join } from "path";
 import vm from "vm";
 
 let input;
-if (existsSync("/dev/stdin")) {
+if (!process.stdin.isTTY) {
+  input = await new Promise((resolve, reject) => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => (data += chunk));
+    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", reject);
+  });
+} else if (existsSync("/dev/stdin")) {
   input = readFileSync("/dev/stdin", "utf8");
 } else {
   input = await new Promise((resolve, reject) => {
